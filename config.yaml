@@ -1,0 +1,59 @@
+app:
+  log_level: INFO
+  tz: UTC
+
+data_dir: "./data"
+
+symbols:
+  - "BTC/USDT"
+
+timeframes:
+  - "1d"
+  - "4h"
+  - "1h"
+  - "15m"
+  - "5m"
+
+exchanges:
+  primary:
+    id: "binance"
+  fallback:
+    id: "bybit"
+  # Secrets are provided via environment variables only.
+  credentials_env:
+    binance:
+      api_key: "BINANCE_API_KEY"
+      api_secret: "BINANCE_API_SECRET"
+    bybit:
+      api_key: "BYBIT_API_KEY"
+      api_secret: "BYBIT_API_SECRET"
+
+storage:
+  candles_subdir: "candles"
+  parquet_compression: "snappy"
+
+downloader:
+  # Use CCXT built-in rate limit handling.
+  enable_rate_limit: true
+  # Upper bound requests that can be retried per fetch call.
+  max_retries: 8
+  # Base delay for exponential backoff.
+  retry_backoff_seconds: 1.5
+  # Number of candles per request (exchange may cap).
+  limit_by_timeframe:
+    "1d": 1000
+    "4h": 1000
+    "1h": 1000
+    "15m": 1000
+    "5m": 1000
+
+live:
+  # Binance spot kline stream base for combined streams.
+  binance_ws_base: "wss://stream.binance.com:9443/stream?streams="
+  reconnect_backoff_seconds: 5
+  # REST poll interval (used as resilience fallback).
+  rest_poll_interval_seconds: 60
+  # Candle considered safely closed if its expected close time is older than now - safety.
+  closed_safety_ms: 2500
+  # WebSocket ping interval is managed by the websockets client; this controls the reconnect loop pacing.
+  max_session_seconds: 0
