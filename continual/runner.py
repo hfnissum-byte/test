@@ -251,6 +251,7 @@ async def run_continual_learning(
                 list(symbols),
                 list(continual_cfg.pattern_detection_timeframes or timeframes),
             )
+            patterns_ok: dict[str, bool] = {}
             for sym in symbols:
                 logger.info("continual cycle=%d building patterns for %s", cycle, sym)
 
@@ -269,7 +270,7 @@ async def run_continual_learning(
                     labeling_exchange_id,
                     required_pattern_tfs,
                 )
-                build_pattern_db(
+                records = build_pattern_db(
                     storage=storage,
                     symbol=sym,
                     detection_timeframes=list(continual_cfg.pattern_detection_timeframes or timeframes),
@@ -277,9 +278,19 @@ async def run_continual_learning(
                     curve_window=int(continual_cfg.curve_window),
                     primary_exchange_id=labeling_exchange_id,
                 )
+                patterns_ok[sym] = bool(records)
+
+                if not patterns_ok[sym]:
+                    logger.warning(
+                        "continual cycle=%d no pattern records produced for %s; skipping training/backtest for this symbol",
+                        cycle,
+                        sym,
+                    )
 
             # 4) Train quantum + classical from the updated pattern records.
             for sym in symbols:
+                if not patterns_ok.get(sym, False):
+                    continue
                 pattern_csv_path_sym = str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv")
 
                 # Quantum
