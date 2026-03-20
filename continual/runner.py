@@ -67,6 +67,30 @@ def _latest_closed_candle_ts(
     return latest
 
 
+def _choose_exchange_id_with_required_timeframes(
+    *,
+    storage: ParquetCandleStorage,
+    exchange_candidates: Sequence[str],
+    symbol: str,
+    required_timeframes: Sequence[str],
+) -> str:
+    """
+    Pick the first exchange candidate that has stored candles for every required timeframe.
+    This prevents pattern labeling/backtesting from failing when primary exchange data is missing.
+    """
+    required_set = set(str(tf) for tf in required_timeframes)
+    for ex in exchange_candidates:
+        ok = True
+        for tf in required_set:
+            if not storage.exists(exchange=str(ex), symbol=symbol, timeframe=str(tf)):
+                ok = False
+                break
+        if ok:
+            return str(ex)
+    # Fall back to the first candidate (caller may handle errors).
+    return str(exchange_candidates[0])
+
+
 @dataclass(frozen=True)
 class ContinualConfig:
     symbols: Sequence[str]
@@ -185,7 +209,8 @@ async def run_continual_learning(
     last_global_ts: Optional[int] = None
 
     # Exchange candidates used for candle updates (matches downloader fallback logic).
-    exchange_ids = [primary_exchange_id, str(exchanges_cfg.get("fallback", {}).get("id", "bybit"))]
+    fallback_exchange_id = str(exchanges_cfg.get("fallback", {}).get("id", "bybit"))
+    exchange_ids = [primary_exchange_id, fallback_exchange_id]
 
     for cycle in range(int(max_cycles) if max_cycles is not None else 10**18):
         start_t = time.time()
@@ -228,13 +253,29 @@ async def run_continual_learning(
             )
             for sym in symbols:
                 logger.info("continual cycle=%d building patterns for %s", cycle, sym)
+
+                decision_tfs = list(continual_cfg.pattern_detection_timeframes or timeframes)
+                required_pattern_tfs = ["1h", *decision_tfs]
+                labeling_exchange_id = _choose_exchange_id_with_required_timeframes(
+                    storage=storage,
+                    exchange_candidates=exchange_ids,
+                    symbol=sym,
+                    required_timeframes=required_pattern_tfs,
+                )
+
+                logger.info(
+                    "continual cycle=%d using exchange=%s for pattern labeling (required=%s)",
+                    cycle,
+                    labeling_exchange_id,
+                    required_pattern_tfs,
+                )
                 build_pattern_db(
                     storage=storage,
                     symbol=sym,
                     detection_timeframes=list(continual_cfg.pattern_detection_timeframes or timeframes),
                     out_dir=pattern_out_path,
                     curve_window=int(continual_cfg.curve_window),
-                    primary_exchange_id=primary_exchange_id,
+                    primary_exchange_id=labeling_exchange_id,
                 )
 
             # 4) Train quantum + classical from the updated pattern records.
@@ -297,12 +338,26 @@ async def run_continual_learning(
                     champion_quantum_model_path = str(Path(continual_cfg.quantum_champion_out_dir) / "quantum_model.joblib")
                     vector_db_base_dir = str(pattern_out_path / "vector_db")
 
+                    required_exec_tfs = [continual_cfg.backtest_execution_timeframe]
+                    execution_exchange_id = _choose_exchange_id_with_required_timeframes(
+                        storage=storage,
+                        exchange_candidates=exchange_ids,
+                        symbol=sym,
+                        required_timeframes=required_exec_tfs,
+                    )
+                    if execution_exchange_id != primary_exchange_id:
+                        logger.info(
+                            "continual cycle=%d using exchange=%s for backtest execution",
+                            cycle,
+                            execution_exchange_id,
+                        )
+
                     backtest_cfg = BacktestConfig(
                         symbol=sym,
                         decision_timeframe=list(continual_cfg.pattern_detection_timeframes or timeframes)[0],
                         execution_timeframe=continual_cfg.backtest_execution_timeframe,
                         exit_horizon=continual_cfg.backtest_exit_horizon,
-                        exchange_id=primary_exchange_id,
+                        exchange_id=execution_exchange_id,
                         eval_start_fraction=continual_cfg.backtest_eval_start_fraction,
                         max_events=continual_cfg.backtest_max_events,
                         initial_equity=continual_cfg.backtest_initial_equity,
