@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -282,6 +282,11 @@ async def run_continual_learning(
                     time.time() - t_c,
                 )
 
+            # Mark the latest processed closed candle timestamp before any
+            # potentially fragile backtest/promotion/reporting step.
+            # This prevents repeated expensive rebuilds if reporting throws.
+            last_global_ts = latest_ts
+
             # 5) Run baseline backtest to measure improvement.
             if continual_cfg.run_backtest_each_cycle:
                 for sym in symbols:
@@ -357,14 +362,17 @@ async def run_continual_learning(
                             sym,
                         )
                         # Run baseline once using the promoted champions (writes audit reports).
-                        backtest_cfg.report_base_dir = str(cycle_dir / "champion_initial")
+                        initial_bt_cfg = replace(
+                            backtest_cfg,
+                            report_base_dir=str(cycle_dir / "champion_initial"),
+                        )
                         backtest_and_compare(
                             storage=storage,
                             pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
                             classical_model_path=champion_classical_model_path,
                             quantum_model_path=champion_quantum_model_path,
                             vector_db_base_dir=vector_db_base_dir,
-                            cfg=backtest_cfg,
+                            cfg=initial_bt_cfg,
                         )
                         logger.info(
                             "continual cycle=%d baseline backtest done for %s (initial promotion)",
@@ -374,24 +382,30 @@ async def run_continual_learning(
                         continue
 
                     # 5.2 Backtest champion and challenger and compare.
-                    backtest_cfg.report_base_dir = str(cycle_dir / "champion_eval")
+                    champ_bt_cfg = replace(
+                        backtest_cfg,
+                        report_base_dir=str(cycle_dir / "champion_eval"),
+                    )
                     res_champ = backtest_and_compare(
                         storage=storage,
                         pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
                         classical_model_path=champion_classical_model_path,
                         quantum_model_path=champion_quantum_model_path,
                         vector_db_base_dir=vector_db_base_dir,
-                        cfg=backtest_cfg,
+                        cfg=champ_bt_cfg,
                     )
 
-                    backtest_cfg.report_base_dir = str(cycle_dir / "challenger_eval")
+                    cand_bt_cfg = replace(
+                        backtest_cfg,
+                        report_base_dir=str(cycle_dir / "challenger_eval"),
+                    )
                     res_cand = backtest_and_compare(
                         storage=storage,
                         pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
                         classical_model_path=candidate_classical_model_path,
                         quantum_model_path=candidate_quantum_model_path,
                         vector_db_base_dir=vector_db_base_dir,
-                        cfg=backtest_cfg,
+                        cfg=cand_bt_cfg,
                     )
 
                     # Promotion decision per model.
@@ -432,8 +446,6 @@ async def run_continual_learning(
                         promote_q,
                         promote_c,
                     )
-
-            last_global_ts = latest_ts
 
             elapsed = time.time() - start_t
             await asyncio.sleep(max(0.1, continual_cfg.poll_interval_seconds - elapsed))
