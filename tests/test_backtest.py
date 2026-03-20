@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import pandas as pd
 
 from backtest.engine import BacktestConfig, backtest_and_compare
 from data.storage import ParquetCandleStorage
@@ -26,9 +27,16 @@ def test_backtest_baseline_comparison(tmp_path: Path) -> None:
     if not (pattern_csv.exists() and quantum_model_path.exists() and classical_model_path.exists() and vector_db_base_dir.exists()):
         pytest.skip("Models/pattern DB artifacts not available in this environment.")
 
+    # Continual-learning overwrites `pattern_records_BTC_USDT.csv` based on whatever
+    # detection timeframes were last run. Pick an available decision timeframe
+    # so the backtest doesn't fail due to missing `4h` rows.
+    df = pd.read_csv(pattern_csv)
+    available_tfs = set(df["timeframe"].unique().tolist())
+    decision_tf = "4h" if "4h" in available_tfs else ("1h" if "1h" in available_tfs else ("15m" if "15m" in available_tfs else sorted(available_tfs)[0]))
+
     bt_cfg = BacktestConfig(
         symbol="BTC/USDT",
-        decision_timeframe="4h",
+        decision_timeframe=decision_tf,
         execution_timeframe="5m",
         exit_horizon="15m",
         exchange_id=str(cfg.get("exchanges", {}).get("primary", {}).get("id", "binance")),

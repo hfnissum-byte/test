@@ -13,6 +13,7 @@ class DatasetArrays:
     X: np.ndarray
     y_dir: np.ndarray
     y_return: Optional[np.ndarray]
+    timestamps: np.ndarray
 
 
 def _literal_eval_if_str(value: object):
@@ -66,10 +67,18 @@ def build_training_arrays(
 
     # Limit to speed up training. We sample stratified to preserve both classes.
     if max_rows is not None and len(df) > max_rows:
-        per_class = max_rows // 2
-        df_good = df[df["y_dir"] == 1].sample(n=min(per_class, (df["y_dir"] == 1).sum()), random_state=seed)
-        df_bad = df[df["y_dir"] == 0].sample(n=min(per_class, (df["y_dir"] == 0).sum()), random_state=seed)
-        df = pd.concat([df_good, df_bad], axis=0).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        # Deterministic cap: keep the most recent examples per class.
+        # This removes random sampling that breaks time-correct training.
+        per_class = int(max_rows // 2)
+        df = df.sort_values("timestamp")
+        df_good_all = df[df["y_dir"] == 1]
+        df_bad_all = df[df["y_dir"] == 0]
+        df_good = df_good_all.tail(min(per_class, len(df_good_all)))
+        df_bad = df_bad_all.tail(min(per_class, len(df_bad_all)))
+        df = pd.concat([df_good, df_bad], axis=0).sort_values("timestamp").reset_index(drop=True)
+
+    # Keep timestamps aligned with X/y_dir after filtering/capping.
+    timestamps = df["timestamp"].to_numpy(dtype=np.int64)
 
     # Parse embeddings only for the rows we keep.
     embeddings = []
@@ -104,5 +113,6 @@ def build_training_arrays(
     else:
         y_ret_arr = None
 
-    return DatasetArrays(X=X, y_dir=y_dir, y_return=y_ret_arr)
+    # If y_ret is missing everywhere and gets set to None, X/y_dir still align.
+    return DatasetArrays(X=X, y_dir=y_dir, y_return=y_ret_arr, timestamps=timestamps)
 

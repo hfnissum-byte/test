@@ -84,6 +84,10 @@ class ContinualConfig:
     quantum_model_out_dir: str = "data/models/quantum_current"
     classical_model_out_dir: str = "data/models/classical_current"
 
+    # Promotion targets (only replaced if challenger beats champion).
+    quantum_champion_out_dir: str = "data/models/quantum_champion"
+    classical_champion_out_dir: str = "data/models/classical_champion"
+
     # Backtest outputs (reports overwrite via new run timestamp in dir per cycle if desired)
     run_backtest_each_cycle: bool = True
     backtest_execution_timeframe: str = "5m"
@@ -104,6 +108,13 @@ class ContinualConfig:
     backtest_p_long_threshold: float = 0.55
     backtest_p_short_threshold: float = 0.55
     backtest_pattern_sim_top_k: int = 50
+
+    # Promotion gate (auditable and deterministic).
+    promotion_enabled: bool = True
+    promotion_min_trade_count: float = 5.0
+    promotion_require_sharpe_ge: bool = True
+    promotion_require_net_return_ge: bool = True
+    promotion_require_max_drawdown_le: bool = True
 
     # Determinism
     train_seed: int = 42
@@ -161,6 +172,8 @@ async def run_continual_learning(
         pattern_detection_timeframes=pattern_detection_timeframes,
         quantum_model_out_dir=quantum_model_out_dir,
         classical_model_out_dir=classical_model_out_dir,
+        quantum_champion_out_dir=str(Path(quantum_model_out_dir).parent / "quantum_champion"),
+        classical_champion_out_dir=str(Path(classical_model_out_dir).parent / "classical_champion"),
         run_backtest_each_cycle=bool(backtest_each_cycle),
         train_seed=int(train_seed),
     )
@@ -273,8 +286,10 @@ async def run_continual_learning(
             if continual_cfg.run_backtest_each_cycle:
                 for sym in symbols:
                     logger.info("continual cycle=%d running baseline backtest for %s", cycle, sym)
-                    classical_model_path = str(Path(continual_cfg.classical_model_out_dir) / "classical_model.joblib")
-                    quantum_model_path = str(Path(continual_cfg.quantum_model_out_dir) / "quantum_model.joblib")
+                    candidate_classical_model_path = str(Path(continual_cfg.classical_model_out_dir) / "classical_model.joblib")
+                    candidate_quantum_model_path = str(Path(continual_cfg.quantum_model_out_dir) / "quantum_model.joblib")
+                    champion_classical_model_path = str(Path(continual_cfg.classical_champion_out_dir) / "classical_model.joblib")
+                    champion_quantum_model_path = str(Path(continual_cfg.quantum_champion_out_dir) / "quantum_model.joblib")
                     vector_db_base_dir = str(pattern_out_path / "vector_db")
 
                     backtest_cfg = BacktestConfig(
@@ -298,16 +313,125 @@ async def run_continual_learning(
                         p_short_threshold=continual_cfg.backtest_p_short_threshold,
                         pattern_sim_top_k=continual_cfg.backtest_pattern_sim_top_k,
                     )
-                    # Reports are written to disk by backtest engine.
-                    backtest_and_compare(
+
+                    def _should_promote(champ: dict[str, Any], cand: dict[str, Any]) -> bool:
+                        # Backtest returns trade_count as float; treat as numeric.
+                        if float(cand.get("trade_count", 0.0)) < float(continual_cfg.promotion_min_trade_count):
+                            return False
+                        if continual_cfg.promotion_require_sharpe_ge:
+                            if float(cand.get("sharpe", 0.0)) < float(champ.get("sharpe", 0.0)):
+                                return False
+                        if continual_cfg.promotion_require_net_return_ge:
+                            if float(cand.get("net_return", 0.0)) < float(champ.get("net_return", 0.0)):
+                                return False
+                        if continual_cfg.promotion_require_max_drawdown_le:
+                            if float(cand.get("max_drawdown", 1.0)) > float(champ.get("max_drawdown", 0.0)):
+                                return False
+                        return True
+
+                    # Determine whether we have a champion yet.
+                    champion_quantum_exists = Path(champion_quantum_model_path).exists()
+                    champion_classical_exists = Path(champion_classical_model_path).exists()
+
+                    cycle_dir = Path("backtest/results/continual") / f"cycle_{cycle:06d}_{sym.replace('/', '_')}"
+                    cycle_dir.mkdir(parents=True, exist_ok=True)
+
+                    # 5.1 Evaluate champion on the locked forward window.
+                    if not champion_quantum_exists or not champion_classical_exists or not continual_cfg.promotion_enabled:
+                        # No champion yet (or promotion disabled): promote candidates immediately.
+                        Path(continual_cfg.quantum_champion_out_dir).mkdir(parents=True, exist_ok=True)
+                        Path(continual_cfg.classical_champion_out_dir).mkdir(parents=True, exist_ok=True)
+                        # Copy model artifacts deterministically if present.
+                        for src, dst in [
+                            (candidate_quantum_model_path, champion_quantum_model_path),
+                            (candidate_classical_model_path, champion_classical_model_path),
+                        ]:
+                            src_p = Path(src)
+                            if not src_p.exists():
+                                raise RuntimeError(f"Candidate model missing for promotion: {src}")
+                            Path(dst).write_bytes(src_p.read_bytes())
+
+                        logger.info(
+                            "continual cycle=%d promoted initial challenger to champion for %s",
+                            cycle,
+                            sym,
+                        )
+                        # Run baseline once using the promoted champions (writes audit reports).
+                        backtest_cfg.report_base_dir = str(cycle_dir / "champion_initial")
+                        backtest_and_compare(
+                            storage=storage,
+                            pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
+                            classical_model_path=champion_classical_model_path,
+                            quantum_model_path=champion_quantum_model_path,
+                            vector_db_base_dir=vector_db_base_dir,
+                            cfg=backtest_cfg,
+                        )
+                        logger.info(
+                            "continual cycle=%d baseline backtest done for %s (initial promotion)",
+                            cycle,
+                            sym,
+                        )
+                        continue
+
+                    # 5.2 Backtest champion and challenger and compare.
+                    backtest_cfg.report_base_dir = str(cycle_dir / "champion_eval")
+                    res_champ = backtest_and_compare(
                         storage=storage,
                         pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
-                        classical_model_path=classical_model_path,
-                        quantum_model_path=quantum_model_path,
+                        classical_model_path=champion_classical_model_path,
+                        quantum_model_path=champion_quantum_model_path,
                         vector_db_base_dir=vector_db_base_dir,
                         cfg=backtest_cfg,
                     )
-                    logger.info("continual cycle=%d baseline backtest done for %s", cycle, sym)
+
+                    backtest_cfg.report_base_dir = str(cycle_dir / "challenger_eval")
+                    res_cand = backtest_and_compare(
+                        storage=storage,
+                        pattern_csv_path=str(pattern_out_path / f"pattern_records_{sym.replace('/', '_')}.csv"),
+                        classical_model_path=candidate_classical_model_path,
+                        quantum_model_path=candidate_quantum_model_path,
+                        vector_db_base_dir=vector_db_base_dir,
+                        cfg=backtest_cfg,
+                    )
+
+                    # Promotion decision per model.
+                    champ_q = res_champ["results"]["quantum"]
+                    cand_q = res_cand["results"]["quantum"]
+                    champ_c = res_champ["results"]["classical"]
+                    cand_c = res_cand["results"]["classical"]
+
+                    promote_q = _should_promote(champ_q, cand_q)
+                    promote_c = _should_promote(champ_c, cand_c)
+
+                    promotion_out = {
+                        "cycle": cycle,
+                        "symbol": sym,
+                        "promote_quantum": promote_q,
+                        "promote_classical": promote_c,
+                        "champion_quantum_metrics": champ_q,
+                        "challenger_quantum_metrics": cand_q,
+                        "champion_classical_metrics": champ_c,
+                        "challenger_classical_metrics": cand_c,
+                    }
+                    (cycle_dir / "promotion.json").write_text(
+                        __import__("json").dumps(promotion_out, indent=2), encoding="utf-8"
+                    )
+
+                    # Copy promoted artifacts (if any).
+                    if promote_q:
+                        Path(continual_cfg.quantum_champion_out_dir).mkdir(parents=True, exist_ok=True)
+                        Path(champion_quantum_model_path).write_bytes(Path(candidate_quantum_model_path).read_bytes())
+                    if promote_c:
+                        Path(continual_cfg.classical_champion_out_dir).mkdir(parents=True, exist_ok=True)
+                        Path(champion_classical_model_path).write_bytes(Path(candidate_classical_model_path).read_bytes())
+
+                    logger.info(
+                        "continual cycle=%d promotion decision for %s: quantum=%s classical=%s",
+                        cycle,
+                        sym,
+                        promote_q,
+                        promote_c,
+                    )
 
             last_global_ts = latest_ts
 

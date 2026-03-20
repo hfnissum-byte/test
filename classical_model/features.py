@@ -17,6 +17,8 @@ class SequenceDataset:
     y_dir: np.ndarray
     # If present, shape: [n_windows]
     y_return: Optional[np.ndarray]
+    # Window end timestamps: shape [n_windows]
+    ts_end: np.ndarray
 
 
 def _literal_eval_if_str(value: object):
@@ -66,9 +68,16 @@ def build_sequence_dataset(
     if len(df) == 0:
         raise ValueError("No Good/Bad rows found after filtering.")
 
-    # Limit labeled rows for speed (sequence windows derived from these rows).
+    # Deterministic cap: keep most recent labeled rows.
+    # This prevents random sampling from breaking time-correct training.
     if max_labeled_rows is not None and len(df) > max_labeled_rows:
-        df = df.sample(n=max_labeled_rows, random_state=seed).reset_index(drop=True)
+        df = df.sort_values("timestamp")
+        per_label = int(max_labeled_rows // 2)
+        df_good_all = df[df["label"] == "Good"]
+        df_bad_all = df[df["label"] == "Bad"]
+        df_good = df_good_all.tail(min(per_label, len(df_good_all)))
+        df_bad = df_bad_all.tail(min(per_label, len(df_bad_all)))
+        df = pd.concat([df_good, df_bad], axis=0).sort_values("timestamp").reset_index(drop=True)
 
     # Parse + validate embeddings early for deterministic window building.
     embeddings: list[list[float]] = []
@@ -78,7 +87,9 @@ def build_sequence_dataset(
 
     label_map = {"Good": 1, "Bad": 0}
 
-    for _, row in df.iterrows():
+    ts_all = df["timestamp"].to_numpy(dtype=np.int64)
+
+    for i, row in df.iterrows():
         emb = _parse_embedding(row["embedding"])
         if len(emb) != EMBED_DIM:
             raise ValueError(f"Unexpected embedding dim: got {len(emb)} expected {EMBED_DIM}")
@@ -118,6 +129,9 @@ def build_sequence_dataset(
     X_windows: list[np.ndarray] = []
     y_dir_windows: list[int] = []
     y_ret_windows: list[float] = []
+    ts_windows: list[int] = []
+
+    ts_arr = df2["timestamp"].to_numpy(dtype=np.int64)
 
     for (sym, tf), grp in df2.groupby(["symbol", "timeframe"]):
         grp = grp.sort_values("timestamp")
@@ -133,6 +147,7 @@ def build_sequence_dataset(
             y_dir_windows.append(int(y_dir_arr[last_idx]))
             if y_return_arr is not None:
                 y_ret_windows.append(float(y_return_arr[last_idx]))
+            ts_windows.append(int(ts_arr[last_idx]))
 
     if len(X_windows) == 0:
         raise ValueError("Not enough labeled rows to build any sequence windows.")
@@ -144,5 +159,6 @@ def build_sequence_dataset(
     else:
         y_return_out = None
 
-    return SequenceDataset(X_seq=X_seq, y_dir=y_dir_out, y_return=y_return_out)
+    ts_end_out = np.asarray(ts_windows, dtype=np.int64)
+    return SequenceDataset(X_seq=X_seq, y_dir=y_dir_out, y_return=y_return_out, ts_end=ts_end_out)
 

@@ -150,23 +150,72 @@ class ClassicalSequenceEstimator:
         y_dir: np.ndarray,
         y_return: Optional[np.ndarray] = None,
         val_fraction: float = 0.2,
+        *,
+        X_val_seq: Optional[np.ndarray] = None,
+        y_dir_val: Optional[np.ndarray] = None,
+        y_return_val: Optional[np.ndarray] = None,
     ) -> dict[str, float]:
         if self.backend == "sklearn_fallback":
-            return self._fit_sklearn(X_seq, y_dir, y_return=y_return)
+            return self._fit_sklearn(
+                X_seq,
+                y_dir,
+                y_return=y_return,
+                X_val_seq=X_val_seq,
+                y_dir_val=y_dir_val,
+                y_return_val=y_return_val,
+            )
 
         # Torch training loop (not used in this runtime unless torch exists).
-        return self._fit_torch(X_seq, y_dir, y_return=y_return, val_fraction=val_fraction)
+        return self._fit_torch(
+            X_seq,
+            y_dir,
+            y_return=y_return,
+            val_fraction=val_fraction,
+            X_val_seq=X_val_seq,
+            y_dir_val=y_dir_val,
+            y_return_val=y_return_val,
+        )
 
     def _fit_sklearn(
         self,
         X_seq: np.ndarray,
         y_dir: np.ndarray,
         y_return: Optional[np.ndarray],
+        *,
+        X_val_seq: Optional[np.ndarray] = None,
+        y_dir_val: Optional[np.ndarray] = None,
+        y_return_val: Optional[np.ndarray] = None,
     ) -> dict[str, float]:
         from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
-        from sklearn.model_selection import train_test_split
 
         X_feat = self._flatten(X_seq).astype(np.float32, copy=False)
+
+        if X_val_seq is not None and y_dir_val is not None:
+            X_val_feat = self._flatten(X_val_seq).astype(np.float32, copy=False)
+            X_train_s = self._scaler.fit_transform(X_feat)
+            X_val_s = self._scaler.transform(X_val_feat)
+
+            self._dir_clf.fit(X_train_s, y_dir)
+            proba_val = self._dir_clf.predict_proba(X_val_s)[:, 1]
+            y_val = y_dir_val
+
+            y_pred_val = (proba_val >= 0.5).astype(int)
+            metrics: dict[str, float] = {"val_accuracy": float(accuracy_score(y_val, y_pred_val))}
+            if len(np.unique(y_val)) == 2:
+                metrics["val_roc_auc"] = float(roc_auc_score(y_val, proba_val))
+
+            if y_return is not None and y_return_val is not None:
+                if len(y_return) != len(y_dir):
+                    raise ValueError("y_return length mismatch")
+                if len(y_return_val) != len(y_val):
+                    raise ValueError("y_return_val length mismatch")
+                self._ret_reg.fit(X_train_s, y_return)
+                y_ret_pred = self._ret_reg.predict(X_val_s)
+                metrics["val_return_mae"] = float(mean_absolute_error(y_return_val, y_ret_pred))
+            return metrics
+
+        # Compatibility fallback: random split + random val.
+        from sklearn.model_selection import train_test_split
 
         X_train, X_val, y_train, y_val = train_test_split(
             X_feat, y_dir, test_size=0.2, random_state=self.cfg.seed, stratify=y_dir
@@ -204,22 +253,34 @@ class ClassicalSequenceEstimator:
         y_dir: np.ndarray,
         y_return: Optional[np.ndarray],
         val_fraction: float,
+        *,
+        X_val_seq: Optional[np.ndarray] = None,
+        y_dir_val: Optional[np.ndarray] = None,
+        y_return_val: Optional[np.ndarray] = None,
     ) -> dict[str, float]:
         import torch  # type: ignore
-        from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
 
-        X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-            X_seq, y_dir, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
-        )
-
-        if y_return is not None:
-            _, _, y_ret_train, y_ret_val = train_test_split(
-                X_seq, y_return, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
-            )
+        if X_val_seq is not None and y_dir_val is not None:
+            X_train, X_val = X_seq, X_val_seq
+            y_dir_train, y_dir_val = y_dir, y_dir_val
+            y_ret_train = y_return
+            y_ret_val = y_return_val
         else:
-            y_ret_train = None
-            y_ret_val = None
+            # Compatibility fallback: random split.
+            from sklearn.model_selection import train_test_split
+
+            X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+                X_seq, y_dir, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
+            )
+
+            if y_return is not None:
+                _, _, y_ret_train, y_ret_val = train_test_split(
+                    X_seq, y_return, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
+                )
+            else:
+                y_ret_train = None
+                y_ret_val = None
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = self._torch_model.to(device)

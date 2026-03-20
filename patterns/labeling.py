@@ -94,43 +94,90 @@ def label_pattern_instances(
         # Nothing can be labeled due to lookahead gaps.
         return instances
 
-    # 2) Quantile-labeling per (pattern_type, timeframe).
+    # 2) Time-horizon-correct quantile-labeling per (pattern_type, timeframe).
+    #
+    # The old implementation computed empirical CDFs from the full dataset,
+    # which means an event's Good/Bad thresholds were partially influenced
+    # by future events. This version computes, for each instance and each
+    # horizon key (1h/4h/24h), the quantile rank using only prior events
+    # whose forward-return horizon has fully elapsed:
+    #   prior_ts <= current_ts - horizon_step_ms
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for inst in with_returns:
         key = (str(inst["pattern_type"]), str(inst["timeframe"]))
         grouped.setdefault(key, []).append(inst)
 
-    # Precompute distributions.
-    dists: dict[tuple[str, str], dict[str, np.ndarray]] = {}
-    for key, group in grouped.items():
-        by_h: dict[str, list[float]] = {h: [] for h in cfg.horizons_hours.keys()}
-        for inst in group:
-            for h in cfg.horizons_hours.keys():
-                by_h[h].append(float(inst["forward_returns"][h]))
-        dists[key] = {h: np.array(vals, dtype=float) for h, vals in by_h.items()}
-
     # 3) Assign weighted Good/Bad/Neutral.
     good_threshold = float(cfg.good_quantile)  # weights sum to 1 by default
     bad_threshold = float(cfg.bad_quantile)
 
-    for inst in with_returns:
-        key = (str(inst["pattern_type"]), str(inst["timeframe"]))
-        dist_by_h = dists[key]
+    # BIT (Fenwick tree) helper for efficient prefix counts.
+    def _bit_update(bit: list[int], idx: int, delta: int) -> None:
+        # idx is 1-based
+        n = len(bit) - 1
+        while idx <= n:
+            bit[idx] += delta
+            idx += idx & -idx
 
-        weighted_score = 0.0
+    def _bit_query(bit: list[int], idx: int) -> int:
+        # sum of [1..idx], idx is 1-based
+        s = 0
+        while idx > 0:
+            s += bit[idx]
+            idx -= idx & -idx
+        return s
+
+    for key, group in grouped.items():
+        group_sorted = sorted(group, key=lambda x: int(x["timestamp"]))
+        ts = np.asarray([int(inst["timestamp"]) for inst in group_sorted], dtype=np.int64)
+        m = ts.size
+        if m == 0:
+            continue
+
+        weighted_score = np.zeros(m, dtype=float)
+
+        # For each horizon, compute horizon-specific quantile ranks q_i.
         for horizon_key, weight in cfg.horizon_weights.items():
-            q = _quantile_rank(dist_by_h[horizon_key], float(inst["forward_returns"][horizon_key]))
+            values = np.asarray([float(inst["forward_returns"][horizon_key]) for inst in group_sorted], dtype=float)
+            step_hours = float(cfg.horizons_hours[horizon_key])
+            step_ms = int(step_hours * 3_600_000)
+
+            # Coordinate compress float values for BIT indexing.
+            uniq = np.unique(values)
+            # Rank is 1-based.
+            ranks = np.searchsorted(uniq, values, side="left").astype(int) + 1
+
+            bit = [0 for _ in range(len(uniq) + 2)]
+            eligible_count = 0
+            # `eligible_count` tracks how many leading instances are eligible for
+            # current index (i.e., their timestamp <= current_ts - step_ms).
+            k = 0
+
+            q = np.full(m, 0.5, dtype=float)
+            for i in range(m):
+                cutoff = int(ts[i] - step_ms)
+                # Add instances that are now eligible and strictly before i.
+                while k < i and int(ts[k]) <= cutoff:
+                    _bit_update(bit, int(ranks[k]), 1)
+                    k += 1
+                eligible_count = k
+                if eligible_count > 0:
+                    c_le = _bit_query(bit, int(ranks[i]))
+                    q[i] = float(c_le) / float(eligible_count)
+
             weighted_score += float(weight) * q
 
-        if weighted_score >= good_threshold:
-            label: Label = "Good"
-        elif weighted_score <= bad_threshold:
-            label = "Bad"
-        else:
-            label = "Neutral"
+        for i, inst in enumerate(group_sorted):
+            score = float(weighted_score[i])
+            if score >= good_threshold:
+                label: Label = "Good"
+            elif score <= bad_threshold:
+                label = "Bad"
+            else:
+                label = "Neutral"
 
-        inst["label"] = label
-        inst["label_score"] = weighted_score
+            inst["label"] = label
+            inst["label_score"] = score
 
     # 4) Merge back; instances without returns get Neutral with empty returns.
     out: list[dict[str, Any]] = []

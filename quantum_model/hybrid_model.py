@@ -110,6 +110,10 @@ class HybridQuantumInspiredEstimator:
         y_dir: np.ndarray,
         y_return: Optional[np.ndarray] = None,
         val_fraction: float = 0.2,
+        *,
+        X_val: Optional[np.ndarray] = None,
+        y_dir_val: Optional[np.ndarray] = None,
+        y_return_val: Optional[np.ndarray] = None,
     ) -> dict[str, float]:
         if X.ndim != 2:
             raise ValueError("X must be 2D [n_samples, embedding_dim]")
@@ -131,30 +135,34 @@ class HybridQuantumInspiredEstimator:
             return metrics
 
         # Torch path
-        metrics = self._fit_torch(Xs, y_dir, y_return=y_return, val_fraction=val_fraction)
+        if X_val is None or y_dir_val is None:
+            # Fallback for callers that don't supply explicit validation data.
+            # This is not time-correct and exists only for compatibility.
+            metrics = self._fit_torch_random_split(Xs, y_dir, y_return=y_return, val_fraction=val_fraction)
+            return metrics
+
+        metrics = self._fit_torch_explicit_val(
+            X_train=Xs,
+            y_dir_train=y_dir,
+            y_return_train=y_return,
+            X_val=X_val,
+            y_dir_val=y_dir_val,
+            y_return_val=y_return_val,
+        )
         return metrics
 
-    def _fit_torch(
+    def _fit_torch_explicit_val(
         self,
-        Xs: np.ndarray,
-        y_dir: np.ndarray,
-        y_return: Optional[np.ndarray],
-        val_fraction: float,
+        *,
+        X_train: np.ndarray,
+        y_dir_train: np.ndarray,
+        y_return_train: Optional[np.ndarray],
+        X_val: np.ndarray,
+        y_dir_val: np.ndarray,
+        y_return_val: Optional[np.ndarray],
     ) -> dict[str, float]:
         import torch  # type: ignore
-        from sklearn.model_selection import train_test_split
         from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
-
-        X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-            Xs, y_dir, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
-        )
-        if y_return is not None:
-            _, _, y_ret_train, y_ret_val = train_test_split(
-                Xs, y_return, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
-            )
-        else:
-            y_ret_train = None
-            y_ret_val = None
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model: torch.nn.Module = self._torch_model.to(device)
@@ -165,17 +173,21 @@ class HybridQuantumInspiredEstimator:
         bce = torch.nn.BCEWithLogitsLoss()
         mse = torch.nn.MSELoss()
 
+        # X_train is already scaled (Xs).
         X_train_t = torch.from_numpy(X_train).to(device)
         y_dir_train_t = torch.from_numpy(y_dir_train.astype(np.float32)).to(device)
-        X_val_t = torch.from_numpy(X_val).to(device)
+
+        # Val arrays must be scaled using the already-fitted scaler.
+        X_val_s = self.scaler.transform(X_val).astype(np.float32, copy=False)
+        X_val_t = torch.from_numpy(X_val_s).to(device)
         y_dir_val_t = torch.from_numpy(y_dir_val.astype(np.float32)).to(device)
 
-        if y_ret_train is not None:
-            y_ret_train_t = torch.from_numpy(y_ret_train.astype(np.float32)).to(device)
-            y_ret_val_t = torch.from_numpy(y_ret_val.astype(np.float32)).to(device)
-        else:
-            y_ret_train_t = None
-            y_ret_val_t = None
+        y_ret_train_t = None
+        y_ret_val_t = None
+        if y_return_train is not None:
+            y_ret_train_t = torch.from_numpy(y_return_train.astype(np.float32)).to(device)
+        if y_return_val is not None:
+            y_ret_val_t = torch.from_numpy(y_return_val.astype(np.float32)).to(device)
 
         n = X_train_t.shape[0]
         for _epoch in range(self.cfg.epochs):
@@ -206,12 +218,105 @@ class HybridQuantumInspiredEstimator:
         y_pred_val = (prob_val >= 0.5).astype(int)
         acc = float(accuracy_score(y_dir_val, y_pred_val))
         auc = float(roc_auc_score(y_dir_val, prob_val))
-        metrics = {"val_accuracy": acc, "val_roc_auc": auc}
+        metrics: dict[str, float] = {"val_accuracy": acc}
+        # ROC-AUC requires both classes.
+        if len(np.unique(y_dir_val)) == 2:
+            metrics["val_roc_auc"] = auc
 
-        if y_ret_val_t is not None and y_return is not None:
+        if y_ret_val_t is not None:
             y_ret_true = y_ret_val_t.detach().cpu().numpy()
-            y_ret_mae = mean_absolute_error(y_ret_true, ret_pred_val.detach().cpu().numpy())
+            y_ret_pred = ret_pred_val.detach().cpu().numpy()
+            y_ret_mae = mean_absolute_error(y_ret_true, y_ret_pred)
             metrics["val_return_mae"] = float(y_ret_mae)
+
+        return metrics
+
+    def _fit_torch_random_split(
+        self,
+        Xs: np.ndarray,
+        y_dir: np.ndarray,
+        y_return: Optional[np.ndarray],
+        val_fraction: float,
+    ) -> dict[str, float]:
+        """
+        Compatibility fallback that performs a random validation split.
+
+        For time-correct training/validation, callers should pass explicit
+        X_val/y_dir_val/y_return_val and use `_fit_torch_explicit_val`.
+        """
+        import torch  # type: ignore
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error
+
+        X_train, X_val, y_dir_train, y_dir_val = train_test_split(
+            Xs, y_dir, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
+        )
+        if y_return is not None:
+            _, _, y_ret_train, y_ret_val = train_test_split(
+                Xs, y_return, test_size=val_fraction, random_state=self.cfg.seed, stratify=y_dir
+            )
+        else:
+            y_ret_train = None
+            y_ret_val = None
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model: torch.nn.Module = self._torch_model.to(device)
+
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
+        )
+        bce = torch.nn.BCEWithLogitsLoss()
+        mse = torch.nn.MSELoss()
+
+        X_train_t = torch.from_numpy(X_train).to(device)
+        y_dir_train_t = torch.from_numpy(y_dir_train.astype(np.float32)).to(device)
+
+        # X_val comes from already-scaled Xs, but keep consistent typing.
+        X_val_t = torch.from_numpy(X_val).to(device)
+        y_dir_val_t = torch.from_numpy(y_dir_val.astype(np.float32)).to(device)
+
+        y_ret_train_t = None
+        y_ret_val_t = None
+        if y_ret_train is not None:
+            y_ret_train_t = torch.from_numpy(y_ret_train.astype(np.float32)).to(device)
+        if y_ret_val is not None:
+            y_ret_val_t = torch.from_numpy(y_ret_val.astype(np.float32)).to(device)
+
+        n = X_train_t.shape[0]
+        for _epoch in range(self.cfg.epochs):
+            perm = torch.randperm(n, device=device)
+            for start in range(0, n, self.cfg.batch_size):
+                idx = perm[start : start + self.cfg.batch_size]
+                xb = X_train_t[idx]
+                yb_dir = y_dir_train_t[idx]
+
+                opt.zero_grad(set_to_none=True)
+                dir_logit, ret_pred = model(xb)
+                loss_dir = bce(dir_logit, yb_dir)
+                loss = loss_dir
+                if y_ret_train_t is not None:
+                    yb_ret = y_ret_train_t[idx]
+                    loss_ret = mse(ret_pred, yb_ret)
+                    loss = loss_dir + loss_ret
+                loss.backward()
+                opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            dir_logit_val, ret_pred_val = model(X_val_t)
+            prob_val = torch.sigmoid(dir_logit_val).detach().cpu().numpy()
+
+        y_pred_val = (prob_val >= 0.5).astype(int)
+        acc = float(accuracy_score(y_dir_val, y_pred_val))
+        metrics: dict[str, float] = {"val_accuracy": acc}
+
+        if len(np.unique(y_dir_val)) == 2:
+            metrics["val_roc_auc"] = float(roc_auc_score(y_dir_val, prob_val))
+
+        if y_ret_val_t is not None:
+            y_ret_true = y_ret_val_t.detach().cpu().numpy()
+            y_ret_pred = ret_pred_val.detach().cpu().numpy()
+            metrics["val_return_mae"] = float(mean_absolute_error(y_ret_true, y_ret_pred))
 
         return metrics
 

@@ -7,7 +7,6 @@ from typing import Optional, Sequence
 
 import numpy as np
 from sklearn.metrics import accuracy_score, mean_absolute_error, roc_auc_score
-from sklearn.model_selection import train_test_split
 
 from .dataset import build_training_arrays
 from .hybrid_model import HybridModelConfig, HybridQuantumInspiredEstimator
@@ -23,6 +22,10 @@ def train_quantum_model(
     seed: int = 42,
     cfg: Optional[HybridModelConfig] = None,
 ) -> dict[str, float]:
+    # Step 1 correctness: time-correct holdout with 24h embargo.
+    embargo_ms = 24 * 60 * 60 * 1000
+    val_fraction = 0.2
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -42,20 +45,54 @@ def train_quantum_model(
     X = arrays.X
     y_dir = arrays.y_dir
     y_ret = arrays.y_return
+    timestamps = arrays.timestamps
 
-    X_train, X_val, y_dir_train, y_dir_val = train_test_split(
-        X, y_dir, test_size=0.2, random_state=seed, stratify=y_dir
-    )
+    order = np.argsort(timestamps)
+    X = X[order]
+    y_dir = y_dir[order]
+    timestamps = timestamps[order]
     if y_ret is not None:
-        _, _, y_ret_train, y_ret_val = train_test_split(
-            X, y_ret, test_size=0.2, random_state=seed, stratify=y_dir
+        y_ret = y_ret[order]
+
+    n = len(timestamps)
+    if n < 10:
+        raise ValueError(f"Not enough samples for time split: n={n}")
+
+    n_train_end = int(np.floor(n * (1.0 - val_fraction)))
+    n_train_end = max(1, min(n_train_end, n - 1))
+    val_start_ts = int(timestamps[n_train_end])
+    train_cutoff_ts = int(val_start_ts - embargo_ms)
+
+    train_mask = timestamps <= train_cutoff_ts
+    val_mask = timestamps >= val_start_ts
+
+    if int(np.sum(train_mask)) < 5 or int(np.sum(val_mask)) < 5:
+        raise ValueError(
+            f"Time split produced too few samples (train={int(np.sum(train_mask))}, val={int(np.sum(val_mask))}, "
+            f"val_start_ts={val_start_ts}, embargo_ms={embargo_ms})"
         )
+
+    X_train = X[train_mask]
+    y_dir_train = y_dir[train_mask]
+    X_val = X[val_mask]
+    y_dir_val = y_dir[val_mask]
+
+    if y_ret is not None:
+        y_ret_train = y_ret[train_mask]
+        y_ret_val = y_ret[val_mask]
     else:
         y_ret_train = None
         y_ret_val = None
 
     est = HybridQuantumInspiredEstimator(cfg=cfg)
-    est.fit(X_train, y_dir_train, y_return=y_ret_train)
+    est.fit(
+        X_train,
+        y_dir_train,
+        y_return=y_ret_train,
+        X_val=X_val,
+        y_dir_val=y_dir_val,
+        y_return_val=y_ret_val,
+    )
 
     # Validation metrics
     proba = est.predict_proba(X_val)

@@ -24,6 +24,10 @@ def train_classical_model(
     max_windows: Optional[int] = 50_000,
     seed: int = 42,
 ) -> dict[str, float]:
+    # Step 1 correctness: time-correct holdout with 24h embargo.
+    embargo_ms = 24 * 60 * 60 * 1000
+    val_fraction = 0.2
+
     """
     Train the Transformer+LSTM hybrid baseline.
 
@@ -47,18 +51,66 @@ def train_classical_model(
     X_seq = dataset.X_seq
     y_dir = dataset.y_dir
     y_ret = dataset.y_return
+    ts_end = dataset.ts_end
 
     if max_windows is not None and len(X_seq) > max_windows:
-        rng = np.random.default_rng(seed)
-        idxs = rng.choice(len(X_seq), size=max_windows, replace=False)
-        X_seq = X_seq[idxs]
-        y_dir = y_dir[idxs]
+        order = np.argsort(ts_end)
+        keep = order[-int(max_windows) :]
+        X_seq = X_seq[keep]
+        y_dir = y_dir[keep]
+        ts_end = ts_end[keep]
         if y_ret is not None:
-            y_ret = y_ret[idxs]
+            y_ret = y_ret[keep]
 
     cfg = ClassicalSequenceModelConfig(embedding_dim=X_seq.shape[-1], seq_len=seq_len, seed=seed)
     est = ClassicalSequenceEstimator(cfg=cfg)
-    metrics = est.fit(X_seq, y_dir, y_return=y_ret)
+
+    # Time-based split (single holdout) with embargo to reduce horizon overlap leakage.
+    order = np.argsort(ts_end)
+    X_seq = X_seq[order]
+    y_dir = y_dir[order]
+    ts_end = ts_end[order]
+    if y_ret is not None:
+        y_ret = y_ret[order]
+
+    n = len(ts_end)
+    if n < 10:
+        raise ValueError(f"Not enough windows for time split: n={n}")
+
+    n_train_end = int(np.floor(n * (1.0 - val_fraction)))
+    n_train_end = max(1, min(n_train_end, n - 1))
+    val_start_ts = int(ts_end[n_train_end])
+    train_cutoff_ts = int(val_start_ts - embargo_ms)
+
+    train_mask = ts_end <= train_cutoff_ts
+    val_mask = ts_end >= val_start_ts
+
+    if int(np.sum(train_mask)) < 5 or int(np.sum(val_mask)) < 5:
+        raise ValueError(
+            f"Time split produced too few samples (train={int(np.sum(train_mask))}, val={int(np.sum(val_mask))}, "
+            f"val_start_ts={val_start_ts}, embargo_ms={embargo_ms})"
+        )
+
+    X_train = X_seq[train_mask]
+    y_dir_train = y_dir[train_mask]
+    X_val = X_seq[val_mask]
+    y_dir_val = y_dir[val_mask]
+
+    if y_ret is not None:
+        y_ret_train = y_ret[train_mask]
+        y_ret_val = y_ret[val_mask]
+    else:
+        y_ret_train = None
+        y_ret_val = None
+
+    metrics = est.fit(
+        X_train,
+        y_dir_train,
+        y_return=y_ret_train,
+        X_val_seq=X_val,
+        y_dir_val=y_dir_val,
+        y_return_val=y_ret_val,
+    )
 
     # Save
     model_path = out_path / "classical_model.joblib"

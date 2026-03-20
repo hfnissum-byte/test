@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from classical_model.features import build_sequence_dataset
 from classical_model.inference import load_model
@@ -17,12 +18,17 @@ def test_train_and_infer_classical_fallback(tmp_path: Path) -> None:
     pattern_csv = _repo_root() / "data" / "patterns" / "pattern_records_BTC_USDT.csv"
     assert pattern_csv.exists()
 
+    df = pd.read_csv(pattern_csv)
+    available_tfs = sorted(df["timeframe"].unique().tolist())
+    # Prefer the original default, but fall back if continual-learning overwrote artifacts.
+    chosen_tf = "4h" if "4h" in available_tfs else ("1h" if "1h" in available_tfs else available_tfs[0])
+
     # Restrict to one timeframe to keep runtime bounded.
     metrics = train_classical_model(
         pattern_csv_path=str(pattern_csv),
         out_dir=str(tmp_path),
         symbols=["BTC/USDT"],
-        timeframes=["4h"],
+        timeframes=[chosen_tf],
         horizon="1h",
         seq_len=6,
         stride=1,
@@ -41,7 +47,7 @@ def test_train_and_infer_classical_fallback(tmp_path: Path) -> None:
     dataset = build_sequence_dataset(
         pattern_csv_path=str(pattern_csv),
         symbols=["BTC/USDT"],
-        timeframes=["4h"],
+        timeframes=[chosen_tf],
         seq_len=6,
         horizon="1h",
         max_labeled_rows=2000,
